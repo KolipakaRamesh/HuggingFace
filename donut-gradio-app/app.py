@@ -2,21 +2,29 @@ import gradio as gr
 from PIL import Image
 import torch
 from transformers import DonutProcessor, VisionEncoderDecoderModel
+import json
+import re
 
-# Load model and processor
-model_id = "naver-clova-ix/donut-base-finetuned-docvqa"
+model_id = "naver-clova-ix/donut-base-finetuned-cord-v2"
 processor = DonutProcessor.from_pretrained(model_id)
 model = VisionEncoderDecoderModel.from_pretrained(model_id)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
-# Inference function
-def answer_question(image: Image.Image, question: str):
-    if image is None or question.strip() == "":
-        return "⚠️ Please upload an image and enter a question."
+def safe_parse_json(text):
+    text = text.strip()
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", text)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        text = text[start:end+1]
+    return json.loads(text)
 
-    # Format prompt
-    prompt = f"<s_docvqa><question>{question}</question><image>"
+def extract_document_json(image: Image.Image):
+    if image is None:
+        return json.dumps({"error": "Please upload a document image."}, indent=2)
+
+    prompt = "<s_cord-v2>"
 
     try:
         image = image.convert("RGB")
@@ -26,27 +34,32 @@ def answer_question(image: Image.Image, question: str):
         outputs = model.generate(
             pixel_values,
             decoder_input_ids=decoder_input_ids,
-            max_length=512,
+            max_length=1024,
             pad_token_id=processor.tokenizer.pad_token_id,
             eos_token_id=processor.tokenizer.eos_token_id
         )
 
-        result = processor.batch_decode(outputs, skip_special_tokens=True)[0]
-        return result
+        decoded = processor.batch_decode(outputs, skip_special_tokens=True)[0]
+
+        try:
+            parsed_json = safe_parse_json(decoded)
+            return json.dumps(parsed_json, indent=2)
+        except Exception as e:
+            return json.dumps({
+                "error": "Failed to parse model output as JSON.",
+                "raw_output": decoded,
+                "exception": str(e)
+            }, indent=2)
 
     except Exception as e:
-        return f"❌ Error: {str(e)}"
+        return json.dumps({"error": str(e)}, indent=2)
 
-# Gradio Interface
 demo = gr.Interface(
-    fn=answer_question,
-    inputs=[
-        gr.Image(type="pil", label="Upload Document Image"),
-        gr.Textbox(label="Enter Your Question", placeholder="e.g., What is the invoice number?")
-    ],
-    outputs=gr.Textbox(label="Answer"),
-    title="🧾 Donut DocVQA - Ask Questions About Your Documents",
-    description="Upload a document (like an invoice or form), type a question, and get an answer using the Donut DocVQA model.",
+    fn=extract_document_json,
+    inputs=gr.Image(type="pil", label="Upload Document Image"),
+    outputs=gr.Code(label="Extracted JSON", language="json"),
+    title="📄 Donut Document Extractor (CORD-v2)",
+    description="Upload a receipt or document and get structured data as formatted JSON using Donut.",
     allow_flagging="never"
 )
 
